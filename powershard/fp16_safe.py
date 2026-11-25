@@ -43,6 +43,25 @@ def prepared_matmul(a, prepared):
     return torch.matmul((af / sa).half(), bh).float() * sa * sb
 
 
+def prepared_matmul_pre_scale(xf, max_a, prepared, out_scale):
+    """Same as prepared_matmul_pre, but the per-output-row weight scale is applied after the GEMM."""
+    bh, sb, bound_b = prepared
+    sa = power2_scale(torch.maximum(max_a / 16384., max_a * bound_b / 16384.))
+    ah = (xf / sa).half()
+    scale = sa * sb if out_scale is None else sa * sb * out_scale
+    return torch.matmul(ah, bh).float() * scale
+
+
+def safe_linear_pre_scale(x, max_a, weight, bias=None, constants=None, out_scale=None):
+    vector = x.ndim == 1
+    a = x.unsqueeze(0) if vector else x
+    m = max_a.unsqueeze(0) if vector else max_a
+    out = prepared_matmul_pre_scale(a, m, prepare_matmul(weight.transpose(-1, -2), constants), out_scale)
+    if vector:
+        out = out.squeeze(0)
+    return out if bias is None else out + bias.float()
+
+
 def scaled_matmul(a, b):
     """A[...,M,K] @ B[...,K,N] через half GEMM, FP32 output и компенсацию.
 

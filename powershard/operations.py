@@ -93,6 +93,14 @@ def dequantize_rows(q, scales, convrot, group_size, dtype=torch.float16, check=T
     return w.to(dtype)
 
 
+def _tile_consts(q, scale):
+    """FP16 weight scale and an overflow bound for the scaled tile."""
+    sc = scale.float().reshape(-1, 1)
+    from .fp16_safe import power2_scale
+    bound = power2_scale(q.abs().to(torch.float32).sum(dim=1).amax().reshape(1, 1) * 1.05)
+    return (1.0, bound, sc.half().reshape(-1))
+
+
 class Int8Linear(nn.Module):
     def __init__(self, src, quant, rows):
         super().__init__()
@@ -102,29 +110,43 @@ class Int8Linear(nn.Module):
         self.bias = src.bias
         self._ps_original_compute_dtype = src.weight.dtype
         self.convrot, self.group_size, self.rows = quant["convrot"], quant["group_size"], rows
+        self._ps_tile_consts = {}
 
     def forward(self, x):
         safe = getattr(self, "_ps_safe", False)
         tracker = getattr(self, "_ps_tracker", None)
         x = x.float() if safe else x.half()
         out = torch.empty(x.shape[:-1] + (self.out_features,), dtype=x.dtype, device=x.device)
+        from . import fp16_safe as _fs
         prepared = getattr(self, "_ps_prepared", None)
-        for a in range(0, self.out_features, self.rows):
-            b = min(a + self.rows, self.out_features)
+        fast = safe and not self._ps_fp32 and prepared is None
+        max_a = None
+        if fast and self.convrot:
+            h = regular_hadamard(self.group_size, x.device)
+            x = (x.reshape(*x.shape[:-1], -1, self.group_size) @ h.T).reshape_as(x)
+        if fast:
+            max_a = x.abs().amax(dim=-1, keepdim=True)
+        step = self.out_features if fast else self.rows
+        for a in range(0, self.out_features, step):
+            b = min(a + step, self.out_features)
+            bias = None if self.bias is None else self.bias[a:b]
             if prepared is not None:
-                from .fp16_safe import prepared_matmul
-                value = prepared_matmul(x, prepared[a//self.rows])
-                out[...,a:b] = value if self.bias is None else value+self.bias[a:b].float()
+                value = _fs.prepared_matmul(x, prepared[a // self.rows])
+                out[..., a:b] = value if bias is None else value + bias.float()
                 continue
-            w = dequantize_rows(self.weight[a:b], self.weight_scale[a:b], self.convrot, self.group_size,
-                                dtype=torch.float32 if safe else torch.float16, check=tracker is None)
-            bias = None if self.bias is None else self.bias[a:b].to(x.dtype)
-            if safe and not self._ps_fp32:
-                from .fp16_safe import safe_linear
-                out[..., a:b] = safe_linear(x, w, bias)
+            if fast:
+                consts = self._ps_tile_consts.get(a)
+                if consts is None:
+                    consts = _tile_consts(self.weight[a:b], self.weight_scale[a:b])
+                    self._ps_tile_consts[a] = consts
+                out[..., a:b] = _fs.safe_linear_pre_scale(
+                    x, max_a, self.weight[a:b].to(torch.float16), bias, (1.0, consts[1]), consts[2])
             else:
-                out[..., a:b] = F.linear(x, w, bias)
-            del w
+                w = dequantize_rows(self.weight[a:b], self.weight_scale[a:b], self.convrot,
+                                    self.group_size, dtype=torch.float32 if safe else torch.float16,
+                                    check=tracker is None)
+                out[..., a:b] = F.linear(x, w, None if bias is None else bias.to(x.dtype))
+                del w
         if tracker is not None:
             tracker.observe(self._ps_finite_slot, out)
         elif not torch.isfinite(out).all():
@@ -171,7 +193,7 @@ def prepared_linears(modules, budget, enabled=True):
     # QuantLinear owns packed qbytes and has weight=None. Its forward performs
     # dequantization/scaling itself; the prepared-weight cache only understands
     # the floating Linear and rowwise Int8Linear representations below.
-    supported = all(isinstance(m, (Linear, Int8Linear)) for m in modules)
+    supported = all(isinstance(m, Linear) and not isinstance(m, Int8Linear) for m in modules)
     use = enabled and supported and size+staging <= budget and all(getattr(m,"_ps_safe",False) and not m._ps_fp32 for m in modules)
     info = dict(prepared_weight_bytes=size if use else 0, preparation_peak_estimate=size+staging if use else 0,
                 preparation=("active MLP, reused across token chunks" if use else

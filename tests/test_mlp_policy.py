@@ -46,18 +46,14 @@ def test_mlp_modes_match_unchunked(quant,mode,chunk):
         assert m.fc1.weight.dtype==torch.int8 and m.fc1.convrot and m.fc1.group_size==16
 
 
-def test_preparation_is_once_per_active_mlp(monkeypatch):
-    import powershard.operations as ops
+def test_int8_mlp_keeps_no_prepared_copy():
     m=mlp(True);m._ps_mlp_policy=H3PatchConfig(True,True,False,2,"manual");m._ps_mlp_chunk=2
-    count=0;original=ops.dequantize_rows
-    def counted(*a,**kw):
-        nonlocal count
-        count+=1
-        return original(*a,**kw)
-    monkeypatch.setattr(ops,"dequantize_rows",counted)
     with torch.no_grad():m(torch.randn(17,16))
-    assert count==64//8+16//8 # ten row tiles, not ten * nine token chunks
     assert m._ps_mlp_report["chunks"]==9
+    assert not any(hasattr(v,"_ps_prepared") for v in m.modules())
+    # Tile constants are computed once per Linear and reused across token chunks.
+    assert list(m.fc1._ps_tile_consts.keys())==[0]
+    assert list(m.fc2._ps_tile_consts.keys())==[0]
 
 
 def test_preparation_releases_after_error():
